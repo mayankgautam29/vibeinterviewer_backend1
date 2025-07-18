@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or specific domain like ["http://localhost:3000"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,15 +31,17 @@ app.add_middleware(
 
 
 @tool
-def save_interview(summary: str, score: int):
+def save_interview(summary: str, score: int,userId: str,jobId: str):
     """
     Saves the final interview summary and numeric score to the database.
     """
     try:
         print("🔧 Saving interview...")
         collection.insert_one({
-            "summary": summary,
-            "score": score
+            "interviewSummary": summary,
+            "interviewScore": score,
+            "userId": userId,
+            "jobId": jobId
         })
         print("✅ Saved:", summary[:60], score)
         return "Interview summary and score saved to database."
@@ -83,7 +85,7 @@ def interview_node(state: State):
     SYSTEM_PROMPT = f"""
 If the user has just started the interview, greet them first (only once), then proceed to ask a interview questions as per the job description required. If the answer is empty just mark 0. 
 If a user has already answered, skip the greeting and ask the next relevant question. Keep the interview to 5 questions only.
-If the answer of the candidate is not good enough, do not mark them good. Be strict while scoring and saving the results.Do not give any response on the user's previous answer just ask them the next question thanking them for the reply.
+If the answer of the candidate is not good enough, do not mark them good. Be strict while scoring and saving the results.Do not give any response on the user's previous answer just ask them the next question thanking them for the reply. You will also get the userId and the jobId which you need to send while calling the save_interview.
 
 Using appropriate tools, save the summary of the interview (performance of the applicant) and score of that interview out of 100.
 
