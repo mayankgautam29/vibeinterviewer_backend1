@@ -15,20 +15,16 @@ import base64
 import requests
 import uuid
 
-# Load environment variables
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 mongo_uri = os.getenv("MONGO_URI")
 
-# MongoDB for saving interview summary
 client = MongoClient(mongo_uri)
 db = client["test"]
 collection = db["interviews"]
 
-# FastAPI setup
 app = FastAPI()
 
-# Allow all CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,7 +33,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Tool for saving interview summary
 @tool
 def save_interview(summary: str, score: int, userId: str, jobId: str):
     """
@@ -58,7 +53,6 @@ def save_interview(summary: str, score: int, userId: str, jobId: str):
         print("❌ Failed to save:", str(e))
         return f"Failed to save interview: {str(e)}"
 
-# LangGraph state
 class State(TypedDict):
     question: str
     answer: str
@@ -68,12 +62,10 @@ class State(TypedDict):
     count: int
     audio_base64: str
 
-# Tools and LLM initialization
 tools = [save_interview]
 llm = init_chat_model(model_provider="openai", model="gpt-4.1-mini")
 llm_with_tools = llm.bind_tools(tools)
 
-# Text-to-speech using OpenAI TTS
 def get_tts_audio_base64(text: str) -> str:
     response = requests.post(
         "https://api.openai.com/v1/audio/speech",
@@ -89,7 +81,6 @@ def get_tts_audio_base64(text: str) -> str:
     )
     return base64.b64encode(response.content).decode("utf-8")
 
-# Interview logic node
 def interview_node(state: State):
     answer = state["answer"]
     resume = state["resume"]
@@ -131,7 +122,6 @@ def route_query(state: State) -> dict:
 
 tool_node = ToolNode(tools=[save_interview])
 
-# Build LangGraph
 graph_builder = StateGraph(State)
 graph_builder.add_node("interview_node", interview_node)
 graph_builder.add_node("wait_for_input_node", wait_for_input_node)
@@ -145,13 +135,11 @@ graph_builder.add_edge("wait_for_input_node", END)
 def compile_graph_with_checkpointer(checkpointer):
     return graph_builder.compile(checkpointer=checkpointer)
 
-# Async context manager for MongoDBSaver
 @asynccontextmanager
 async def create_mongo_checkpoint(uri: str, namespace: str):
     with MongoDBSaver.from_conn_string(uri, namespace=namespace) as cp:
         yield cp
 
-# WebSocket endpoint
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
