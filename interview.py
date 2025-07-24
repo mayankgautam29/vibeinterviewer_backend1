@@ -1,26 +1,34 @@
 from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from typing import TypedDict
-from typing_extensions import Annotated
 from pymongo import MongoClient
 from langchain.chat_models import init_chat_model
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END, START
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.mongodb import MongoDBSaver
+from contextlib import asynccontextmanager
 import json
 import os
 import base64
 import requests
+import uuid
 
+# Load environment variables
 load_dotenv()
-app = FastAPI()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 mongo_uri = os.getenv("MONGO_URI")
+
+# MongoDB for saving interview summary
 client = MongoClient(mongo_uri)
 db = client["test"]
 collection = db["interviews"]
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-from fastapi.middleware.cors import CORSMiddleware
 
+# FastAPI setup
+app = FastAPI()
+
+# Allow all CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,9 +37,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+# Tool for saving interview summary
 @tool
-def save_interview(summary: str, score: int,userId: str,jobId: str):
+def save_interview(summary: str, score: int, userId: str, jobId: str):
     """
     Saves the final interview summary and numeric score to the database.
     """
@@ -42,7 +50,7 @@ def save_interview(summary: str, score: int,userId: str,jobId: str):
             "interviewScore": score,
             "userId": userId,
             "jobId": jobId,
-            "status":"pending"
+            "status": "pending"
         })
         print("✅ Saved:", summary[:60], score)
         return "Interview summary and score saved to database."
@@ -50,6 +58,7 @@ def save_interview(summary: str, score: int,userId: str,jobId: str):
         print("❌ Failed to save:", str(e))
         return f"Failed to save interview: {str(e)}"
 
+# LangGraph state
 class State(TypedDict):
     question: str
     answer: str
@@ -59,10 +68,12 @@ class State(TypedDict):
     count: int
     audio_base64: str
 
+# Tools and LLM initialization
 tools = [save_interview]
 llm = init_chat_model(model_provider="openai", model="gpt-4.1-mini")
 llm_with_tools = llm.bind_tools(tools)
 
+# Text-to-speech using OpenAI TTS
 def get_tts_audio_base64(text: str) -> str:
     response = requests.post(
         "https://api.openai.com/v1/audio/speech",
@@ -76,21 +87,19 @@ def get_tts_audio_base64(text: str) -> str:
             "voice": "nova",
         }
     )
-    audio_bytes = response.content
-    return base64.b64encode(audio_bytes).decode("utf-8")
+    return base64.b64encode(response.content).decode("utf-8")
 
+# Interview logic node
 def interview_node(state: State):
     answer = state["answer"]
     resume = state["resume"]
 
     SYSTEM_PROMPT = f"""
-If the user has just started the interview, greet them first (only once), then proceed to ask a interview questions as per the job description required. If the answer is empty just mark 0. 
-If a user has already answered, skip the greeting and ask the next relevant question. Keep the interview to 5 questions only.
-If the answer of the candidate is not good enough, do not mark them good. Be strict while scoring and saving the results.Do not give any response on the user's previous answer just ask them the next question thanking them for the reply. You will also get the userId and the jobId which you need to send while calling the save_interview. Call the tool save_interview only after the last answer and call it only once not more than that.
+If the user has just started the interview, greet them first (only once), then proceed to ask interview questions.
+Keep the interview to 5 questions only. If an answer is not given, mark score 0.
+Be strict while scoring. Call `save_interview` tool only after the 5th answer and only once.
 
-Using appropriate tools, save the summary of the interview (performance of the applicant) and score of that interview out of 100.
-
-Resume Summary (Candidate + Job Description): 
+Resume Summary:
 {resume}
 
 Previous Answer:
@@ -108,21 +117,21 @@ Previous Answer:
             if tool_call["name"] == "save_interview":
                 args = tool_call["args"]
                 save_interview.invoke(args)
+
     return state
 
 def wait_for_input_node(state: State) -> State:
-    print("🕒 Waiting for user input...")
     state["awaiting"] = True
     return state
 
 def route_query(state: State) -> dict:
-    print("🔀 Routing query...")
     if state["question"] == "":
         return {"path": "tools"}
     return {"path": "wait_for_input_node"}
 
 tool_node = ToolNode(tools=[save_interview])
 
+# Build LangGraph
 graph_builder = StateGraph(State)
 graph_builder.add_node("interview_node", interview_node)
 graph_builder.add_node("wait_for_input_node", wait_for_input_node)
@@ -133,52 +142,65 @@ graph_builder.add_edge(START, "interview_node")
 graph_builder.add_edge("interview_node", "wait_for_input_node")
 graph_builder.add_edge("wait_for_input_node", END)
 
-graph = graph_builder.compile()
+def compile_graph_with_checkpointer(checkpointer):
+    return graph_builder.compile(checkpointer=checkpointer)
 
-paused_state = {
-    "question": "",
-    "answer": "",
-    "awaiting": False,
-    "resume": "",
-    "messages": [],
-    "count": 0
-}
+# Async context manager for MongoDBSaver
+@asynccontextmanager
+async def create_mongo_checkpoint(uri: str, namespace: str):
+    with MongoDBSaver.from_conn_string(uri, namespace=namespace) as cp:
+        yield cp
 
+# WebSocket endpoint
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("Client connected")
+    thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+    session_state: State = {
+        "question": "",
+        "answer": "",
+        "awaiting": False,
+        "resume": "",
+        "messages": [],
+        "count": 0,
+        "audio_base64": "",
+    }
 
-    while True:
-        if paused_state["resume"] == "":
-            resume_text = await websocket.receive_text()
-            paused_state["resume"] = resume_text
-            print(resume_text)
-            await websocket.send_text("✅ Resume summary received. Starting interview...")
-            continue
+    async with create_mongo_checkpoint(mongo_uri, "interview_sessions") as mongo_checkpoint:
+        graph_with_mongo = compile_graph_with_checkpointer(mongo_checkpoint)
 
-        if paused_state["count"] >= 5:
-            await websocket.send_text("✅ Interview complete! Thank you for your time.")
-            await websocket.close()
-            break
+        while True:
+            if session_state["resume"] == "":
+                resume_text = await websocket.receive_text()
+                session_state["resume"] = resume_text
+                print("Resume received.")
+                await websocket.send_text("✅ Resume received. Starting interview...")
+                continue
 
-        if paused_state["question"] == "":
-            state = await graph.ainvoke(paused_state)
-            paused_state.update(state)
-            await websocket.send_text(json.dumps({
-                "question": state['question'],
-                "audio_base64": state['audio_base64']
-            }))
-        else:
-            user_input = await websocket.receive_text()
-            paused_state["answer"] = user_input
-            paused_state["awaiting"] = False
-            paused_state["messages"].append({"role": "user", "content": user_input})
-            paused_state["count"] += 1
+            if session_state["count"] >= 5:
+                await websocket.send_text("✅ Interview complete! Thank you for your time.")
+                await websocket.close()
+                break
 
-            state = await graph.ainvoke(paused_state)
-            paused_state.update(state)
-            await websocket.send_text(json.dumps({
-                "question": state['question'],
-                "audio_base64": state['audio_base64']
-            }))
+            if session_state["question"] == "":
+                state = graph_with_mongo.invoke(session_state, config=config)
+                session_state.update(state)
+                await websocket.send_text(json.dumps({
+                    "question": state["question"],
+                    "audio_base64": state["audio_base64"]
+                }))
+            else:
+                user_input = await websocket.receive_text()
+                session_state["answer"] = user_input
+                session_state["awaiting"] = False
+                session_state["messages"].append({"role": "user", "content": user_input})
+                session_state["count"] += 1
+
+                state = graph_with_mongo.invoke(session_state, config=config)
+                session_state.update(state)
+                await websocket.send_text(json.dumps({
+                    "question": state["question"],
+                    "audio_base64": state["audio_base64"]
+                }))
